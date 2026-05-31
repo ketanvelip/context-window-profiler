@@ -10,11 +10,20 @@ load_dotenv()
 
 from .parser import parse_sections, Section
 from .client import get_client
-from .ablation import run_leave_one_out, SectionResult
+from .ablation import (
+    run_leave_one_out,
+    run_cumulative,
+    run_pairwise,
+    SectionResult,
+    CumulativeResult,
+    PairwiseResult,
+)
 from .storage import save_run, list_runs, load_run
-from .report import render_heatmap, render_recommendations
+from .report import render_heatmap, render_recommendations, render_cumulative, render_pairwise
 
 console = Console()
+
+_MODES = click.Choice(["leave-one-out", "cumulative", "pairwise", "all"], case_sensitive=False)
 
 
 def _load_inputs(path: str) -> list[str]:
@@ -30,6 +39,19 @@ def _load_inputs(path: str) -> list[str]:
         except json.JSONDecodeError:
             inputs.append(line)
     return inputs
+
+
+def _estimate_calls(n: int, m: int, mode: str) -> int:
+    loo = m + n * m * 2
+    cumulative = n * m * 2
+    pairwise = (n * (n - 1) // 2) * m * 2
+    if mode == "leave-one-out":
+        return loo
+    if mode == "cumulative":
+        return loo + cumulative
+    if mode == "pairwise":
+        return loo + pairwise
+    return loo + cumulative + pairwise  # all
 
 
 def _result_from_dict(d: dict) -> SectionResult:
@@ -54,7 +76,11 @@ def cli():
 @click.option("--model", envvar="TOGETHER_MODEL", default="meta-llama/Llama-3.3-70B-Instruct-Turbo", show_default=True)
 @click.option("--judge-model", envvar="TOGETHER_JUDGE_MODEL", default=None, help="Defaults to --model")
 @click.option("--task", default="", help="One-line task description (helps the judge evaluate quality)")
-def profile(prompt_file, inputs_file, model, judge_model, task):
+@click.option("--mode", type=_MODES, default="leave-one-out", show_default=True,
+              help="leave-one-out, cumulative, pairwise, or all")
+@click.option("--threshold", default=0.8, show_default=True, type=float,
+              help="Quality threshold for cumulative mode (0–1)")
+def profile(prompt_file, inputs_file, model, judge_model, task, mode, threshold):
     """Run ablation analysis on PROMPT_FILE with inputs from INPUTS_FILE."""
     judge_model = judge_model or model
     prompt = Path(prompt_file).read_text(encoding="utf-8")
@@ -68,18 +94,21 @@ def profile(prompt_file, inputs_file, model, judge_model, task):
     if len(sections) < 2:
         console.print(
             "[red]Fewer than 2 sections detected.[/red]\n"
-            "Add section markers (## Heading, [SECTION: name]…[/SECTION], or <!-- [SECTION: name] -->…<!-- [/SECTION] -->)"
-            " or ensure the prompt has multiple blank-line-separated paragraphs."
+            "Add section markers (## Heading, [SECTION: name]…[/SECTION], or "
+            "<!-- [SECTION: name] -->…<!-- [/SECTION] -->) or ensure the prompt "
+            "has multiple blank-line-separated paragraphs."
         )
         sys.exit(1)
 
     n, m = len(sections), len(inputs)
-    est_calls = m + n * m * 2
+    est = _estimate_calls(n, m, mode)
+
     console.print(f"\n[bold]Sections detected:[/bold] {n}")
     for s in sections:
         console.print(f"  · {s.name}  (~{max(1, len(s.content) // 4)} tokens)")
     console.print(f"\n[bold]Inputs:[/bold]          {m}")
-    console.print(f"[bold]Estimated calls:[/bold] ~{est_calls}")
+    console.print(f"[bold]Mode:[/bold]            {mode}")
+    console.print(f"[bold]Estimated calls:[/bold] ~{est}")
     console.print(f"[bold]Model:[/bold]           {model}")
     console.print(f"[bold]Judge:[/bold]           {judge_model}\n")
 
@@ -87,14 +116,37 @@ def profile(prompt_file, inputs_file, model, judge_model, task):
         raise click.Abort()
 
     client = get_client()
-    results = run_leave_one_out(client, model, judge_model, prompt, sections, inputs, task_desc=task)
 
-    render_heatmap(results, console)
-    render_recommendations(results, console)
+    # LOO is always required — it determines ordering for cumulative and
+    # provides individual impact scores for pairwise delta calculation.
+    loo_results, baselines = run_leave_one_out(
+        client, model, judge_model, prompt, sections, inputs, task_desc=task
+    )
 
-    run_data = {
+    render_heatmap(loo_results, console)
+    render_recommendations(loo_results, console)
+
+    cumulative_result: CumulativeResult | None = None
+    pairwise_result: PairwiseResult | None = None
+
+    if mode in ("cumulative", "all"):
+        cumulative_result = run_cumulative(
+            client, model, judge_model, prompt, sections, inputs,
+            loo_results, baselines, threshold=threshold, task_desc=task,
+        )
+        render_cumulative(cumulative_result, console)
+
+    if mode in ("pairwise", "all"):
+        pairwise_result = run_pairwise(
+            client, model, judge_model, prompt, sections, inputs,
+            loo_results, baselines, task_desc=task,
+        )
+        render_pairwise(pairwise_result, console)
+
+    run_data: dict = {
         "model": model,
         "judge_model": judge_model,
+        "mode": mode,
         "prompt": prompt,
         "inputs": inputs,
         "results": [
@@ -106,9 +158,35 @@ def profile(prompt_file, inputs_file, model, judge_model, task):
                 "sample_reasonings": r.sample_reasonings,
                 "verdict": r.verdict,
             }
-            for r in results
+            for r in loo_results
         ],
     }
+
+    if cumulative_result is not None:
+        run_data["cumulative"] = {
+            "threshold": cumulative_result.threshold,
+            "steps": [
+                {
+                    "removed_section_names": s.removed_section_names,
+                    "tokens_removed": s.tokens_removed,
+                    "avg_quality": s.avg_quality,
+                }
+                for s in cumulative_result.steps
+            ],
+        }
+
+    if pairwise_result is not None:
+        run_data["pairwise"] = [
+            {
+                "section_a": p.section_a,
+                "section_b": p.section_b,
+                "combined_impact": p.combined_impact,
+                "expected_impact": p.expected_impact,
+                "delta": p.delta,
+            }
+            for p in pairwise_result.pairs
+        ]
+
     path = save_run(run_data)
     console.print(f"\n[dim]Results saved → {path}[/dim]")
 
@@ -116,7 +194,7 @@ def profile(prompt_file, inputs_file, model, judge_model, task):
 @cli.command()
 @click.argument("run_file", type=click.Path(), required=False)
 def report(run_file):
-    """Show heatmap from a previous run. Defaults to the most recent."""
+    """Show heatmap (and cumulative/pairwise if available) from a previous run."""
     if run_file:
         path = Path(run_file)
         if not path.exists():
@@ -131,6 +209,34 @@ def report(run_file):
         console.print(f"[dim]Loading: {path}[/dim]")
 
     data = load_run(path)
-    results = [_result_from_dict(r) for r in data["results"]]
-    render_heatmap(results, console)
-    render_recommendations(results, console)
+
+    loo_results = [_result_from_dict(r) for r in data["results"]]
+    render_heatmap(loo_results, console)
+    render_recommendations(loo_results, console)
+
+    if "cumulative" in data:
+        from .ablation import CumulativeStep
+        c = data["cumulative"]
+        steps = [
+            CumulativeStep(
+                removed_section_names=s["removed_section_names"],
+                tokens_removed=s["tokens_removed"],
+                avg_quality=s["avg_quality"],
+            )
+            for s in c["steps"]
+        ]
+        render_cumulative(CumulativeResult(steps=steps, threshold=c["threshold"]), console)
+
+    if "pairwise" in data:
+        from .ablation import PairResult
+        pairs = [
+            PairResult(
+                section_a=p["section_a"],
+                section_b=p["section_b"],
+                combined_impact=p["combined_impact"],
+                expected_impact=p["expected_impact"],
+                delta=p["delta"],
+            )
+            for p in data["pairwise"]
+        ]
+        render_pairwise(PairwiseResult(pairs=pairs), console)
