@@ -14,12 +14,20 @@ from .ablation import (
     run_leave_one_out,
     run_cumulative,
     run_pairwise,
+    _ablate_multiple,
     SectionResult,
     CumulativeResult,
     PairwiseResult,
 )
 from .storage import save_run, list_runs, load_run
-from .report import render_heatmap, render_recommendations, render_cumulative, render_pairwise
+from .report import (
+    render_heatmap,
+    render_recommendations,
+    render_cumulative,
+    render_pairwise,
+    render_trim_summary,
+    render_compare,
+)
 
 console = Console()
 
@@ -240,3 +248,81 @@ def report(run_file):
             for p in data["pairwise"]
         ]
         render_pairwise(PairwiseResult(pairs=pairs), console)
+
+
+@cli.command()
+@click.argument("run_file", type=click.Path(), required=False)
+@click.option("--output", "-o", type=click.Path(), default=None,
+              help="Write trimmed prompt to file (omit to print to stdout)")
+@click.option("--threshold", default=0.1, show_default=True, type=float,
+              help="Remove sections with impact below this value")
+def trim(run_file, output, threshold):
+    """Generate a slimmed prompt by removing low-impact sections.
+
+    Loads the profiling run (default: most recent), re-parses the stored prompt,
+    and strips every section whose impact score is below THRESHOLD.
+    """
+    if run_file:
+        path = Path(run_file)
+        if not path.exists():
+            console.print(f"[red]File not found: {run_file}[/red]")
+            sys.exit(1)
+    else:
+        runs = list_runs()
+        if not runs:
+            console.print("[red]No runs found in ~/.context-profiler/runs/[/red]")
+            sys.exit(1)
+        path = runs[0]
+        console.print(f"[dim]Loading: {path}[/dim]")
+
+    data = load_run(path)
+    prompt = data["prompt"]
+
+    # Re-parse to recover section positions from the stored prompt text
+    sections = parse_sections(prompt)
+    section_pos_map = {s.name: s for s in sections}
+
+    to_remove = []
+    skipped = []
+    for r in data["results"]:
+        if r["impact_score"] < threshold:
+            s = section_pos_map.get(r["section_name"])
+            if s:
+                to_remove.append(s)
+            else:
+                skipped.append(r["section_name"])
+
+    if skipped:
+        console.print(f"[yellow]Warning: could not locate section(s) in re-parsed prompt: {skipped}[/yellow]")
+
+    if not to_remove:
+        console.print(f"[yellow]No sections below impact threshold {threshold:.2f}. Nothing to trim.[/yellow]")
+        return
+
+    trimmed = _ablate_multiple(prompt, to_remove)
+    tokens_saved = sum(r["token_estimate"] for r in data["results"] if r["section_name"] in {s.name for s in to_remove})
+    total_tokens = max(1, len(prompt) // 4)
+
+    render_trim_summary([s.name for s in to_remove], tokens_saved, total_tokens, output, console)
+
+    if output:
+        Path(output).write_text(trimmed, encoding="utf-8")
+    else:
+        console.print("\n[bold]Trimmed prompt:[/bold]\n")
+        console.print(trimmed)
+
+
+@cli.command()
+@click.argument("run_a", type=click.Path(exists=True))
+@click.argument("run_b", type=click.Path(exists=True))
+def compare(run_a, run_b):
+    """Compare two profiling runs side by side.
+
+    Shows impact score changes per section, highlights sections that became
+    more or less critical, and flags new or removed sections.
+    """
+    data_a = load_run(run_a)
+    data_b = load_run(run_b)
+    label_a = Path(run_a).stem
+    label_b = Path(run_b).stem
+    render_compare(data_a, data_b, label_a=label_a, label_b=label_b, console=console)

@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
@@ -122,6 +124,102 @@ def render_cumulative(result: CumulativeResult, console: Console | None = None) 
             f'[red]Quality cliff at step {safe + 1}: removing "{cliff_step.removed_section_names[-1]}" '
             f"drops quality to {cliff_step.avg_quality:.2f}.[/red]"
         )
+
+
+# ── trim ──────────────────────────────────────────────────────────────────────
+
+def render_trim_summary(
+    removed: list[str],
+    tokens_saved: int,
+    total_tokens: int,
+    output_path: str | None,
+    console: Console | None = None,
+) -> None:
+    if console is None:
+        console = Console()
+    names = ", ".join(f'"{n}"' for n in removed)
+    pct = round(tokens_saved / total_tokens * 100) if total_tokens else 0
+    console.print(f"\n[bold]Trimming {len(removed)} section(s):[/bold] {names}")
+    console.print(f"[green]Saves ~{tokens_saved} tokens (~{pct}% of prompt)[/green]")
+    if output_path:
+        console.print(f"[dim]Written to {output_path}[/dim]")
+
+
+# ── compare ───────────────────────────────────────────────────────────────────
+
+def render_compare(
+    data_a: dict,
+    data_b: dict,
+    label_a: str = "A",
+    label_b: str = "B",
+    console: Console | None = None,
+) -> None:
+    if console is None:
+        console = Console()
+
+    map_a = {r["section_name"]: r for r in data_a["results"]}
+    map_b = {r["section_name"]: r for r in data_b["results"]}
+    names = list(map_a.keys()) + [n for n in map_b if n not in map_a]
+
+    table = Table(
+        box=box.ROUNDED,
+        show_header=True,
+        header_style="bold",
+        title=f"Profile Comparison  [{label_a}] vs [{label_b}]",
+    )
+    table.add_column("Section")
+    table.add_column(f"Impact ({label_a})", justify="right")
+    table.add_column(f"Impact ({label_b})", justify="right")
+    table.add_column("Δ", justify="right")
+    table.add_column("Finding")
+
+    for name in names:
+        a = map_a.get(name)
+        b = map_b.get(name)
+
+        if a is None:
+            table.add_row(name, "—", f"{b['impact_score']:.2f}", "—", Text("New in B", style="cyan"))
+        elif b is None:
+            table.add_row(name, f"{a['impact_score']:.2f}", "—", "—", Text("Removed in B", style="dim"))
+        else:
+            delta = round(b["impact_score"] - a["impact_score"], 3)
+            delta_str = f"{delta:+.2f}"
+            if abs(delta) < 0.05:
+                finding = Text("Unchanged", style="dim")
+                delta_cell = Text(delta_str, style="dim")
+            elif delta > 0:
+                finding = Text("More critical in B", style="red")
+                delta_cell = Text(delta_str, style="red")
+            else:
+                finding = Text("Less critical in B", style="green")
+                delta_cell = Text(delta_str, style="green")
+            table.add_row(name, f"{a['impact_score']:.2f}", f"{b['impact_score']:.2f}", delta_cell, finding)
+
+    console.print()
+    console.print(table)
+
+    more_critical = sum(
+        1 for n in names
+        if map_a.get(n) and map_b.get(n) and map_b[n]["impact_score"] - map_a[n]["impact_score"] >= 0.05
+    )
+    less_critical = sum(
+        1 for n in names
+        if map_a.get(n) and map_b.get(n) and map_a[n]["impact_score"] - map_b[n]["impact_score"] >= 0.05
+    )
+    new_count = sum(1 for n in names if n not in map_a)
+    removed_count = sum(1 for n in names if n not in map_b)
+
+    parts = []
+    if more_critical:
+        parts.append(f"[red]{more_critical} more critical[/red]")
+    if less_critical:
+        parts.append(f"[green]{less_critical} less critical[/green]")
+    if new_count:
+        parts.append(f"[cyan]{new_count} new[/cyan]")
+    if removed_count:
+        parts.append(f"[dim]{removed_count} removed[/dim]")
+    if parts:
+        console.print("  " + "  ·  ".join(parts))
 
 
 # ── pairwise ──────────────────────────────────────────────────────────────────
